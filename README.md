@@ -1,3 +1,9 @@
+
+# Внимание! Это личный Fork репозитория от Kartavkun.
+# Основной функционал и поддержка по-прежнему осуществляется в оригинальном репозитории.
+# Этот форк нацелен на доработку недостатков и добавление новых функций.
+# Если вы собираетесь все же использовать этот форк - учитывайте этот факт.
+
 # 🚀 Zapret - Обход блокировок Discord и YouTube
 
 > [!NOTE]
@@ -19,13 +25,13 @@
 **Автоматическая установка одним командой:**
 
 ```bash
-bash <(curl -s https://raw.githubusercontent.com/kartavkun/zapret-discord-youtube/main/setup.sh)
+bash <(curl -s https://raw.githubusercontent.com/MineShadow7/zapret-discord-youtube/main/setup.sh)
 ```
 
 > [!TIP]
 > Если команда выше не работает, попробуйте альтернативный вариант:
 > ```bash
-> bash <(curl -s https://raw.githubusercontent.com/kartavkun/zapret-discord-youtube/main/setup.sh | psub)
+> bash <(curl -s https://raw.githubusercontent.com/MineShadow7/zapret-discord-youtube/main/setup.sh | psub)
 > ```
 
 **Что делает скрипт установки:**
