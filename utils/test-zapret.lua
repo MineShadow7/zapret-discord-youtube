@@ -22,6 +22,9 @@ local colors = {
 local log_file = nil
 local log_path = nil
 
+-- Глобальная статистика для аналитики
+local config_stats = {}
+
 -- Базовые операции с файлами (определены первыми)
 local function file_exists(path)
     local f = io.open(path, "r")
@@ -258,8 +261,8 @@ end
 -- DPI checker defaults (override via MONITOR_* env vars like in monitor.ps1)
 local dpiTimeoutSeconds = 5
 local dpiRangeBytes = 262144
-local dpiWarnMinKB = 14
-local dpiWarnMaxKB = 22
+local dpiWarnMinKB = 13
+local dpiWarnMaxKB = 24
 local dpiMaxParallel = 8
 local dpiCustomUrl = os.getenv("MONITOR_URL")
 if os.getenv("MONITOR_TIMEOUT") then dpiTimeoutSeconds = tonumber(os.getenv("MONITOR_TIMEOUT")) end
@@ -268,41 +271,88 @@ if os.getenv("MONITOR_WARN_MINKB") then dpiWarnMinKB = tonumber(os.getenv("MONIT
 if os.getenv("MONITOR_WARN_MAXKB") then dpiWarnMaxKB = tonumber(os.getenv("MONITOR_WARN_MAXKB")) end
 if os.getenv("MONITOR_MAX_PARALLEL") then dpiMaxParallel = tonumber(os.getenv("MONITOR_MAX_PARALLEL")) end
 
+-- Максимальное количество параллельных тестов (стандартные тесты)
+local maxParallelTests = 12
+if os.getenv("MAX_PARALLEL_TESTS") then maxParallelTests = tonumber(os.getenv("MAX_PARALLEL_TESTS")) end
+
 -- DPI набор и цели
 -- Набор тестов из https://github.com/hyperion-cs/dpi-checkers (Apache-2.0 license)
 -- Авторские права оригинального репозитория dpi-checkers сохранены
 local function get_dpi_suite()
     local url = "https://hyperion-cs.github.io/dpi-checkers/ru/tcp-16-20/suite.json"
     
+    log_info("Загрузка DPI suite из: " .. url)
     local cmd = string.format("curl -s -m %d '%s' 2>/dev/null", dpiTimeoutSeconds, url)
     local output = execute_cmd(cmd)
     
     if not output or output == "" then
-        log_warn("Fetch dpi suite failed.")
+        log_warn("Fetch dpi suite failed. Curl вернул пустой результат.")
+        log_warn("Команда: " .. cmd)
         return {}
     end
     
+    local output_len = string.len(output)
+    log_info(string.format("Получено %d байт от API", output_len))
+
     -- Simple JSON parsing for the suite
     local suite = {}
-    for id, provider, url_str, times in output:gmatch('"id":"([^"]+)".-"provider":"([^"]+)".-"url":"([^"]+)".-"times":(%d+)') do
-        table.insert(suite, {
-            id = id,
-            provider = provider,
-            url = url_str,
-            times = tonumber(times)
-        })
+    -- Находим начало массива и извлекаем все ID, provider, url и times
+    -- Используем более простой подход: находим все значения по порядку
+    local pos = 1
+    local obj_count = 0
+    while true do
+        -- Ищем начало объекта
+        local obj_start = output:find("{", pos, true)
+        if not obj_start then break end
+
+        -- Ищем конец объекта (простой поиск до }, учитывая что URL не содержат })
+        local obj_end = output:find("}", obj_start, true)
+        if not obj_end then break end
+
+        obj_count = obj_count + 1
+        local entry = output:sub(obj_start, obj_end)
+
+        -- Извлекаем поля
+        local id = entry:match('"id"%s*:%s*"([^"]+)"')
+        local provider = entry:match('"provider"%s*:%s*"([^"]+)"')
+        local url_str = entry:match('"url"%s*:%s*"([^"]+)"')
+        local times = entry:match('"times"%s*:%s*(%d+)')
+
+        if id and provider and url_str and times then
+            table.insert(suite, {
+                id = id,
+                provider = provider,
+                url = url_str,
+                times = tonumber(times)
+            })
+        else
+            log_warn(string.format("Объект #%d: не все поля найдены (id=%s, provider=%s, url=%s, times=%s)",
+                obj_count, tostring(id), tostring(provider), url_str and "found" or "nil", tostring(times)))
+        end
+
+        pos = obj_end + 1
     end
     
+    log_info(string.format("Обработано объектов: %d, успешно распарсено: %d", obj_count, #suite))
+
+    if #suite == 0 then
+        log_warn("DPI suite parsing returned 0 targets. Check network or API availability.")
+        log_warn("Первые 200 символов ответа: " .. string.sub(output, 1, 200))
+    end
+
     return suite
 end
 
 local function build_dpi_targets(custom_url)
+    log_info(">>> build_dpi_targets вызван. custom_url = " .. tostring(custom_url))
     local suite = get_dpi_suite()
     local targets = {}
 
     if custom_url then
         table.insert(targets, { id = "CUSTOM", provider = "Custom", url = custom_url })
+        log_info("Используется пользовательский URL. Целей: 1")
     else
+        log_info(string.format("Загружено провайдеров из DPI suite: %d", #suite))
         for _, entry in ipairs(suite) do
             local repeat_count = entry.times or 1
             for i = 0, repeat_count - 1 do
@@ -315,50 +365,107 @@ local function build_dpi_targets(custom_url)
                 })
             end
         end
+        log_info(string.format("Построено целей для тестирования: %d", #targets))
     end
 
     return targets
 end
 
 -- Функции тестирования
-local function test_url(url, timeout, test_label)
-    local args = ""
-    if test_label == "HTTP" then
-        args = "--http1.1"
-    elseif test_label == "TLS1.2" then
-        args = "--tlsv1.2 --tls-max 1.2"
-    elseif test_label == "TLS1.3" then
-        args = "--tlsv1.3 --tls-max 1.3"
+local function map_http_code_to_status(http_code_num)
+    -- 2xx/3xx считаем успехом доступности, остальное ошибка
+    if http_code_num >= 200 and http_code_num < 400 then
+        return "OK"
+    end
+    return "ERR"
+end
+
+local function parse_curl_probe_output(output, exit_code)
+    if not output or output == "" then
+        return "ERR", 0, "NA"
     end
 
-    local cmd = string.format("curl -I -s -m %d -o /dev/null -w '%%{http_code} %%{size_download}' --show-error %s '%s' 2>&1", timeout, args, url)
-    local output, code = execute_cmd(cmd)
-
-    if not output then return "ERR", 0 end
-
-    -- Проверка на SSL/сертификат ошибки
-    if output:match("Could not resolve host") or 
-       output:match("certificate") or 
-       output:match("SSL certificate problem") or 
-       output:match("self[- ]?signed") or 
-       output:match("certificate verify failed") or 
+    if output:match("Could not resolve host") or
+       output:match("certificate") or
+       output:match("SSL certificate problem") or
+       output:match("self[- ]?signed") or
+       output:match("certificate verify failed") or
        output:match("unable to get local issuer certificate") then
-        return "SSL", 0
+        return "SSL", 0, "ERR"
+    end
+
+    if output:match("not supported") or output:match("does not support") or output:match("unsupported") or exit_code == 35 then
+        return "UNSUP", 0, "UNSUP"
     end
 
     local http_code, size = output:match("(%d+)%s+(%d+)")
     if not http_code then
-        if output:match("not supported") or output:match("does not support") or output:match("unsupported") or code == 35 then
-            return "UNSUP", 0
-        end
-        return "ERR", 0
+        return "ERR", 0, "ERR"
     end
 
-    if code == 0 then
-        return "OK", tonumber(size) or 0
-    else
-        return "ERR", 0
+    local http_code_num = tonumber(http_code) or 0
+    local size_num = tonumber(size) or 0
+    local status = map_http_code_to_status(http_code_num)
+    if http_code_num == 0 then
+        status = "ERR"
     end
+    return status, size_num, http_code
+end
+
+local function build_curl_args_for_test(test_label)
+    if test_label == "HTTP" then
+        return "--http1.1"
+    elseif test_label == "TLS1.2" then
+        return "--tlsv1.2 --tls-max 1.2"
+    elseif test_label == "TLS1.3" then
+        return "--tlsv1.3 --tls-max 1.3"
+    end
+    return ""
+end
+
+local function test_url(url, timeout, test_label)
+    local args = build_curl_args_for_test(test_label)
+
+    local cmd = string.format("curl -I -s -m %d -o /dev/null -w '%%{http_code} %%{size_download}' --show-error %s '%s' 2>&1", timeout, args, url)
+    local output, code = execute_cmd(cmd)
+    local status, size = parse_curl_probe_output(output, code)
+    return status, size
+end
+
+-- Параллельное тестирование URL через временные файлы
+local function test_url_batch(url, timeout, test_labels)
+    local tmpdir = "/tmp/zapret-test-" .. os.time() .. "-" .. math.random(10000, 99999)
+    os.execute("mkdir -p " .. tmpdir)
+
+    local results = {}
+    local pids = {}
+
+    -- Запускаем все тесты параллельно
+    for i, test_label in ipairs(test_labels) do
+        local args = build_curl_args_for_test(test_label)
+
+        local output_file = tmpdir .. "/result_" .. i .. ".txt"
+        local cmd = string.format("curl -I -s -m %d -o /dev/null -w '%%{http_code} %%{size_download}' --show-error %s '%s' > '%s' 2>&1 &",
+            timeout, args, url, output_file)
+        os.execute(cmd)
+        table.insert(pids, output_file)
+    end
+
+    -- Ждём завершения всех тестов
+    os.execute("sleep " .. (timeout + 1))
+
+    -- Читаем результаты
+    for i, test_label in ipairs(test_labels) do
+        local output_file = pids[i]
+        local output = read_file(output_file)
+        local status, size, code = parse_curl_probe_output(output)
+        results[test_label] = { status = status, size = size, code = code }
+    end
+
+    -- Удаляем временные файлы
+    os.execute("rm -rf " .. tmpdir)
+
+    return results
 end
 
 local function test_ping(host, count)
@@ -393,36 +500,116 @@ local function load_targets(targets_file)
 end
 
 local function run_standard_tests(config_name, targets, timeout)
-    print(colorize("  > Запуск тестов...", colors.darkgray))
+    print(colorize("  > Запуск тестов (параллельно, батчами по " .. maxParallelTests .. ")...", colors.darkgray))
     write_log("> Запуск тестов...")
 
-    for _, target in ipairs(targets) do
-        local line = string.format("  %-30s ", target.name)
-        io.write(line)
+    -- Инициализация статистики для конфига
+    if not config_stats[config_name] then
+        config_stats[config_name] = {
+            http_ok = 0,
+            http_err = 0,
+            http_unsup = 0,
+            ping_ok = 0,
+            ping_fail = 0,
+            dpi_warn = 0,
+            dpi_ok = 0
+        }
+    end
+    local stats = config_stats[config_name]
 
+    -- Разделяем targets на HTTP/TLS и PING
+    local http_targets = {}
+    local ping_targets = {}
+
+    for _, target in ipairs(targets) do
         if target.value:match("^PING:") then
-            local host = target.value:match("^PING:(.+)$")
-            local result = test_ping(host, 3)
-            local output = colorize("Пинг: " .. result, colors.cyan)
-            print(output)
-            write_log(string.format("%-30s Пинг: %s", target.name, result))
+            table.insert(ping_targets, target)
         else
+            table.insert(http_targets, target)
+        end
+    end
+
+    -- Тестируем HTTP/TLS targets батчами
+    local batch_size = maxParallelTests
+    for batch_start = 1, #http_targets, batch_size do
+        local batch_end = math.min(batch_start + batch_size - 1, #http_targets)
+        local tmpdir = "/tmp/zapret-batch-" .. os.time() .. "-" .. math.random(10000, 99999)
+        os.execute("mkdir -p " .. tmpdir)
+
+        -- Запускаем все тесты батча параллельно
+        for i = batch_start, batch_end do
+            local target = http_targets[i]
+            local tests = { "HTTP", "TLS1.2", "TLS1.3" }
+
+            for j, test_label in ipairs(tests) do
+                local args = build_curl_args_for_test(test_label)
+
+                local output_file = string.format("%s/result_%d_%d.txt", tmpdir, i, j)
+                local cmd = string.format("curl -I -s -m %d -o /dev/null -w '%%{http_code} %%{size_download}' --show-error %s '%s' > '%s' 2>&1 &",
+                    timeout, args, target.value, output_file)
+                os.execute(cmd)
+            end
+        end
+
+        -- Ждём завершения всех тестов батча
+        os.execute("sleep " .. (timeout + 1))
+
+        -- Читаем и выводим результаты батча
+        for i = batch_start, batch_end do
+            local target = http_targets[i]
+            local line = string.format("  %-30s ", target.name)
+            io.write(line)
+
             local tests = { "HTTP", "TLS1.2", "TLS1.3" }
             local results = {}
             local log_results = {}
 
-            for _, test_label in ipairs(tests) do
-                local status, size = test_url(target.value, timeout, test_label)
+            for j, test_label in ipairs(tests) do
+                local output_file = string.format("%s/result_%d_%d.txt", tmpdir, i, j)
+                local output = read_file(output_file)
+                local status, size = parse_curl_probe_output(output)
+
                 local color = colors.green
-                if status == "SSL" then color = colors.red
-                elseif status == "UNSUP" then color = colors.yellow
-                elseif status == "ERR" then color = colors.red end
+
+                -- Подсчет статистики HTTP
+                if status == "OK" then
+                    stats.http_ok = stats.http_ok + 1
+                elseif status == "SSL" or status == "ERR" then
+                    stats.http_err = stats.http_err + 1
+                    color = colors.red
+                elseif status == "UNSUP" then
+                    stats.http_unsup = stats.http_unsup + 1
+                    color = colors.yellow
+                end
+
                 table.insert(results, colorize(test_label .. ":" .. status, color))
                 table.insert(log_results, test_label .. ":" .. status)
             end
 
             print(table.concat(results, " "))
             write_log(string.format("%-30s %s", target.name, table.concat(log_results, " ")))
+        end
+
+        -- Удаляем временные файлы
+        os.execute("rm -rf " .. tmpdir)
+    end
+
+    -- Тестируем PING targets (они быстрые, можем делать последовательно)
+    for _, target in ipairs(ping_targets) do
+        local line = string.format("  %-30s ", target.name)
+        io.write(line)
+
+        local host = target.value:match("^PING:(.+)$")
+        local result = test_ping(host, 3)
+        local output = colorize("Пинг: " .. result, colors.cyan)
+        print(output)
+        write_log(string.format("%-30s Пинг: %s", target.name, result))
+
+        -- Подсчет статистики ping
+        if result ~= "Timeout" then
+            stats.ping_ok = stats.ping_ok + 1
+        else
+            stats.ping_fail = stats.ping_fail + 1
         end
     end
 end
@@ -476,61 +663,192 @@ local function select_configs(all_configs)
     end
 end
 
-local function run_dpi_tests(targets, timeout, range_bytes, warn_min_kb, warn_max_kb)
-    log_info(string.format("Целей: %d. Диапазон: 0-%d байт; Таймаут: %d с; Окно предупреждения: %d-%d КБ", 
-        #targets, range_bytes - 1, timeout, warn_min_kb, warn_max_kb))
-    log_info("Запуск проверок DPI TCP 16-20...")
+local function print_analytics(test_type)
+    print("")
+    print(colorize("=== ANALYTICS ===", colors.cyan))
+    write_log("")
+    write_log("=== ANALYTICS ===")
 
+    -- Находим лучший конфиг
+    local best_config = nil
+    local best_score = -1
+
+    -- Сортируем конфиги для вывода
+    local sorted_configs = {}
+    for config_name, _ in pairs(config_stats) do
+        table.insert(sorted_configs, config_name)
+    end
+    table.sort(sorted_configs)
+
+    for _, config_name in ipairs(sorted_configs) do
+        local stats = config_stats[config_name]
+
+        -- Вычисляем оценку конфига
+        local score = 0
+        if test_type == "standard" then
+            score = stats.http_ok * 10 + stats.ping_ok * 5 - stats.http_err * 20 - stats.ping_fail * 10
+        else
+            -- Для DPI тестов: больше OK и меньше WARN = лучше
+            score = stats.http_ok * 10 + stats.dpi_ok * 100 - stats.http_err * 20 - stats.dpi_warn * 500
+        end
+
+        if score > best_score then
+            best_score = score
+            best_config = config_name
+        end
+
+        -- Формируем строку статистики
+        local stat_line
+        if test_type == "standard" then
+            stat_line = string.format("%s : HTTP OK: %d, ERR: %d, UNSUP: %d, Ping OK: %d, Fail: %d",
+                config_name, stats.http_ok, stats.http_err, stats.http_unsup, stats.ping_ok, stats.ping_fail)
+        else
+            stat_line = string.format("%s : HTTP OK: %d, ERR: %d, UNSUP: %d, DPI OK: %d, WARN: %d",
+                config_name, stats.http_ok, stats.http_err, stats.http_unsup, stats.dpi_ok, stats.dpi_warn)
+        end
+
+        print(stat_line)
+        write_log(stat_line)
+    end
+
+    if best_config then
+        print(colorize("Best strategy: " .. best_config, colors.green))
+        write_log("Best strategy: " .. best_config)
+    end
+end
+
+local function run_dpi_tests(config_name, targets, timeout, range_bytes, warn_min_kb, warn_max_kb)
+    log_info(string.format("Целей: %d. Диапазон: 0-%d байт; Таймаут: %d с; Окно предупреждения: %d-%d КБ",
+        #targets, range_bytes - 1, timeout, warn_min_kb, warn_max_kb))
+    log_info(string.format("Запуск проверок DPI TCP 16-20 (параллельно, батчами по %d)...", dpiMaxParallel))
+
+    -- Инициализация статистики для конфига
+    if not config_stats[config_name] then
+        config_stats[config_name] = {
+            http_ok = 0,
+            http_err = 0,
+            http_unsup = 0,
+            ping_ok = 0,
+            ping_fail = 0,
+            dpi_warn = 0,
+            dpi_ok = 0
+        }
+    end
+    local stats = config_stats[config_name]
     local warn_detected = false
 
-    for _, target in ipairs(targets) do
-        print("")
-        local header = "=== " .. target.id .. " [" .. target.provider .. "] ==="
-        print(colorize(header, colors.darkcyan))
-        write_log(header)
+    -- Обрабатываем targets батчами
+    local batch_size = dpiMaxParallel
+    for batch_start = 1, #targets, batch_size do
+        local batch_end = math.min(batch_start + batch_size - 1, #targets)
+        local tmpdir = "/tmp/zapret-dpi-" .. os.time() .. "-" .. math.random(10000, 99999)
+        os.execute("mkdir -p " .. tmpdir)
 
-        local tests = { "HTTP", "TLS1.2", "TLS1.3" }
-        local target_warned = false
+        -- Запускаем все тесты батча параллельно
+        for i = batch_start, batch_end do
+            local target = targets[i]
+            local tests = { "HTTP", "TLS1.2", "TLS1.3" }
 
-        for _, test_label in ipairs(tests) do
-            local status, size = test_url(target.url, timeout, test_label)
-            local size_kb = math.floor(size / 1024 * 10) / 10
-            local color = colors.green
-            local msg_status = "OK"
+            for j, test_label in ipairs(tests) do
+                local args = build_curl_args_for_test(test_label)
 
-            if status == "SSL" then
-                color = colors.red
-                msg_status = "SSL_ERROR"
-            elseif status == "UNSUP" then
-                color = colors.yellow
-                msg_status = "НЕ_ПОДДЕРЖИВАЕТСЯ"
-            elseif status == "ERR" then
-                color = colors.red
-                msg_status = "ОШИБКА"
+                local output_file = string.format("%s/result_%d_%d.txt", tmpdir, i, j)
+                local range_spec = string.format("0-%d", range_bytes - 1)
+                local cmd = string.format("curl -L --range %s -s -m %d -o /dev/null -w '%%{http_code} %%{size_download}' --show-error %s '%s' > '%s' 2>&1 &",
+                    range_spec, timeout, args, target.url, output_file)
+                os.execute(cmd)
             end
-
-            if size_kb >= warn_min_kb and size_kb <= warn_max_kb and status == "ERR" then
-                msg_status = "ВЕРОЯТНО_ЗАБЛОКИРОВАНО"
-                color = colors.yellow
-                target_warned = true
-            end
-
-            local msg = string.format("  [%s][%s] code=%s size=%d bytes (%.1f KB) status=%s", 
-                target.id, test_label, status, size, size_kb, msg_status)
-            print(colorize(msg, color))
-            write_log(msg)
         end
 
-        if not target_warned then
-            local msg = "  Паттерн замораживания 16-20КБ не обнаружен для этой цели."
-            print(colorize(msg, colors.green))
-            write_log(msg)
-        else
-            local msg = "  Паттерн совпадает с замораживанием 16-20КБ; цензор вероятно блокирует эту стратегию."
-            print(colorize(msg, colors.yellow))
-            write_log(msg)
-            warn_detected = true
+        -- Ждём завершения всех тестов батча
+        os.execute("sleep " .. (timeout + 1))
+
+        -- Читаем и обрабатываем результаты батча
+        for i = batch_start, batch_end do
+            local target = targets[i]
+            print("")
+            local header = "=== " .. target.id .. " [" .. target.provider .. "] ==="
+            print(colorize(header, colors.darkcyan))
+            write_log(header)
+
+            local tests = { "HTTP", "TLS1.2", "TLS1.3" }
+            local target_warned = false
+            local target_failed = false
+
+            for j, test_label in ipairs(tests) do
+                local output_file = string.format("%s/result_%d_%d.txt", tmpdir, i, j)
+                local output = read_file(output_file)
+                local status, size, code_str = parse_curl_probe_output(output)
+
+                local size_kb = math.floor(size / 1024 * 10) / 10
+                local color = colors.green
+                local msg_status = "OK"
+
+                if status == "SSL" then
+                    color = colors.red
+                    msg_status = "SSL_ERROR"
+                    stats.http_err = stats.http_err + 1
+                    target_failed = true
+                elseif status == "UNSUP" then
+                    color = colors.yellow
+                    msg_status = "НЕ_ПОДДЕРЖИВАЕТСЯ"
+                    stats.http_unsup = stats.http_unsup + 1
+                elseif status == "ERR" then
+                    color = colors.red
+                    msg_status = "ОШИБКА"
+                    stats.http_err = stats.http_err + 1
+                    target_failed = true
+                elseif status == "OK" then
+                    stats.http_ok = stats.http_ok + 1
+                end
+
+                -- size=0 не считаем успехом для DPI, даже при 2xx
+                if status == "OK" and size == 0 then
+                    msg_status = "ОШИБКА"
+                    color = colors.red
+                    stats.http_ok = stats.http_ok - 1
+                    stats.http_err = stats.http_err + 1
+                    target_failed = true
+                end
+
+                -- Проверка на LIKELY_BLOCKED: размер в окне 13-24 КБ (не UNSUP)
+                -- Это паттерн TCP 16-20 freeze, даже если получен частичный ответ (206)
+                if size_kb >= warn_min_kb and size_kb <= warn_max_kb and status ~= "UNSUP" then
+                    msg_status = "ВЕРОЯТНО_ЗАБЛОКИРОВАНО"
+                    color = colors.yellow
+                    target_warned = true
+                    -- Корректируем статистику если было OK
+                    if status == "OK" then
+                        stats.http_ok = stats.http_ok - 1
+                    end
+                end
+
+                local msg = string.format("  [%s][%s] code=%s size=%d bytes (%.1f KB) status=%s",
+                    target.id, test_label, code_str or status, size, size_kb, msg_status)
+                print(colorize(msg, color))
+                write_log(msg)
+            end
+
+            if target_warned then
+                local msg = "  Паттерн совпадает с замораживанием 16-20КБ; цензор вероятно блокирует эту стратегию."
+                print(colorize(msg, colors.yellow))
+                write_log(msg)
+                warn_detected = true
+                stats.dpi_warn = stats.dpi_warn + 1
+            elseif target_failed then
+                local msg = "  Обнаружены ошибки тестов для цели; паттерн блокировки не подтвержден."
+                print(colorize(msg, colors.red))
+                write_log(msg)
+            else
+                local msg = "  Паттерн замораживания 16-20КБ не обнаружен для этой цели."
+                print(colorize(msg, colors.green))
+                write_log(msg)
+                stats.dpi_ok = stats.dpi_ok + 1
+            end
         end
+
+        -- Удаляем временные файлы
+        os.execute("rm -rf " .. tmpdir)
     end
 
     print("")
@@ -694,7 +1012,7 @@ local function main()
         if test_type == "standard" then
             run_standard_tests(config, targets, dpiTimeoutSeconds)
         else
-            run_dpi_tests(targets, dpiTimeoutSeconds, dpiRangeBytes, dpiWarnMinKB, dpiWarnMaxKB)
+            run_dpi_tests(config, targets, dpiTimeoutSeconds, dpiRangeBytes, dpiWarnMinKB, dpiWarnMaxKB)
         end
 
         ::continue::
@@ -727,7 +1045,17 @@ local function main()
 
     print("")
     log_ok("Тесты завершены")
+
+    -- Вывод аналитики
+    print_analytics(test_type)
+
     log_info("Файл лога сохранён в: " .. log_path)
+
+    -- Ожидание ввода пользователя
+    print("")
+    print(colorize("Нажмите Enter чтобы продолжить...", colors.cyan))
+    io.read()
+
     close_log()
 end
 
