@@ -5,3 +5,5 @@ result
 # Other ignore
 hostlists/.game_filter.enabled
 utils/log
+
+.idea
