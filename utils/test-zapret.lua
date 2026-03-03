@@ -274,35 +274,78 @@ if os.getenv("MONITOR_MAX_PARALLEL") then dpiMaxParallel = tonumber(os.getenv("M
 local function get_dpi_suite()
     local url = "https://hyperion-cs.github.io/dpi-checkers/ru/tcp-16-20/suite.json"
     
+    log_info("Загрузка DPI suite из: " .. url)
     local cmd = string.format("curl -s -m %d '%s' 2>/dev/null", dpiTimeoutSeconds, url)
     local output = execute_cmd(cmd)
     
     if not output or output == "" then
-        log_warn("Fetch dpi suite failed.")
+        log_warn("Fetch dpi suite failed. Curl вернул пустой результат.")
+        log_warn("Команда: " .. cmd)
         return {}
     end
     
+    local output_len = string.len(output)
+    log_info(string.format("Получено %d байт от API", output_len))
+
     -- Simple JSON parsing for the suite
     local suite = {}
-    for id, provider, url_str, times in output:gmatch('"id":"([^"]+)".-"provider":"([^"]+)".-"url":"([^"]+)".-"times":(%d+)') do
-        table.insert(suite, {
-            id = id,
-            provider = provider,
-            url = url_str,
-            times = tonumber(times)
-        })
+    -- Находим начало массива и извлекаем все ID, provider, url и times
+    -- Используем более простой подход: находим все значения по порядку
+    local pos = 1
+    local obj_count = 0
+    while true do
+        -- Ищем начало объекта
+        local obj_start = output:find("{", pos, true)
+        if not obj_start then break end
+
+        -- Ищем конец объекта (простой поиск до }, учитывая что URL не содержат })
+        local obj_end = output:find("}", obj_start, true)
+        if not obj_end then break end
+
+        obj_count = obj_count + 1
+        local entry = output:sub(obj_start, obj_end)
+
+        -- Извлекаем поля
+        local id = entry:match('"id"%s*:%s*"([^"]+)"')
+        local provider = entry:match('"provider"%s*:%s*"([^"]+)"')
+        local url_str = entry:match('"url"%s*:%s*"([^"]+)"')
+        local times = entry:match('"times"%s*:%s*(%d+)')
+
+        if id and provider and url_str and times then
+            table.insert(suite, {
+                id = id,
+                provider = provider,
+                url = url_str,
+                times = tonumber(times)
+            })
+        else
+            log_warn(string.format("Объект #%d: не все поля найдены (id=%s, provider=%s, url=%s, times=%s)",
+                obj_count, tostring(id), tostring(provider), url_str and "found" or "nil", tostring(times)))
+        end
+
+        pos = obj_end + 1
     end
     
+    log_info(string.format("Обработано объектов: %d, успешно распарсено: %d", obj_count, #suite))
+
+    if #suite == 0 then
+        log_warn("DPI suite parsing returned 0 targets. Check network or API availability.")
+        log_warn("Первые 200 символов ответа: " .. string.sub(output, 1, 200))
+    end
+
     return suite
 end
 
 local function build_dpi_targets(custom_url)
+    log_info(">>> build_dpi_targets вызван. custom_url = " .. tostring(custom_url))
     local suite = get_dpi_suite()
     local targets = {}
 
     if custom_url then
         table.insert(targets, { id = "CUSTOM", provider = "Custom", url = custom_url })
+        log_info("Используется пользовательский URL. Целей: 1")
     else
+        log_info(string.format("Загружено провайдеров из DPI suite: %d", #suite))
         for _, entry in ipairs(suite) do
             local repeat_count = entry.times or 1
             for i = 0, repeat_count - 1 do
@@ -315,6 +358,7 @@ local function build_dpi_targets(custom_url)
                 })
             end
         end
+        log_info(string.format("Построено целей для тестирования: %d", #targets))
     end
 
     return targets
