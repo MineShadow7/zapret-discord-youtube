@@ -197,9 +197,9 @@ $ELEVATE_CMD find /opt/zapret -type d -exec chmod g+s {} \;
 
 # Клонирование репозитория с конфигами
 echo "Клонирование репозитория с конфигами..."
-if ! git clone https://github.com/kartavkun/zapret-discord-youtube.git "$HOME/zapret-configs"; then
+if ! git clone https://github.com/MineShadow7/zapret-discord-youtube.git "$HOME/zapret-configs"; then
   rm -rf $HOME/zapret-configs
-  if ! git clone https://github.com/kartavkun/zapret-discord-youtube.git "$HOME/zapret-configs"; then
+  if ! git clone https://github.com/MineShadow7/zapret-discord-youtube.git "$HOME/zapret-configs"; then
     echo "Ошибка: не удалось клонировать репозиторий с конфигами."
   exit 1
   fi
